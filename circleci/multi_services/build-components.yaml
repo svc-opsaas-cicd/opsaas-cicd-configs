@@ -1,0 +1,15 @@
+api:
+  - api/
+  - services/common/
+  - services/api/
+
+api-doc:
+  - api/
+  
+controller:
+  - services/common/
+  - services/controller/
+ 
+execution-engine:
+  - services/common/
+  - services/execution_engine/

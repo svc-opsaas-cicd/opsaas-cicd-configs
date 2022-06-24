@@ -1,0 +1,350 @@
+version: 2
+
+aliases:
+  - &setup-toolkits
+    name: Setup toolkits
+    command: |
+      sudo apt install unzip
+
+      mkdir -p ~/tools
+      cd ~/tools
+
+      # Download sonarcube scann
+      curl -s --location -o sonar-scanner.zip https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-$SONAR_SCANNER_VERSION.zip
+      unzip sonar-scanner.zip
+
+      echo "export SONAR_SCANNER_VERSION=$SONAR_SCANNER_VERSION" >> $BASH_ENV
+
+      # Install Go 1.17
+      curl -s --location -o go.tgz https://go.dev/dl/go1.17.7.linux-amd64.tar.gz
+      sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf go.tgz
+      export PATH=$PATH:/usr/local/go/bin
+      
+      echo "=====>"
+      go version
+      
+      # Install gotestsum
+      go install gotest.tools/gotestsum@latest
+      
+      # Change for each project
+      echo "export SONARQUBE_PROJECT_KEY=nutanix-beam_oneops-ingestion-service" >> $BASH_ENV
+
+      # Download aws cli
+      curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+      unzip awscliv2.zip
+      sudo ./aws/install
+      
+      # Download kubectl
+      curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+      sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+      
+      # Download argocd cli
+      curl -s --location -o argocd https://github.com/argoproj/argo-cd/releases/download/v2.1.7/argocd-linux-amd64
+      sudo install -o root -g root -m 0755 argocd /usr/local/bin/argocd
+
+      # Evn variables
+      cd ~/project
+      echo "export GIT_SHA=${CIRCLE_SHA1:0:7}" >> $BASH_ENV
+      export GIT_COMMIT_USER=$(git show -s --format='%an' $CIRCLE_SHA1)
+      echo "export GIT_COMMIT_USER=$GIT_COMMIT_USER" >> $BASH_ENV
+      echo "export IMAGE_TAG=$CIRCLE_BRANCH-${CIRCLE_SHA1:0:7}" >> $BASH_ENV
+
+      # Shows toolkits version
+      docker -v
+      cat $BASH_ENV
+  
+  - &build-container-image
+    name: Build container image
+    command: |
+      # Docker login ECR
+      aws ecr get-login-password --region $COMM_ECR_REGION | docker login --username AWS --password-stdin $COMM_ECR_REG
+
+      echo $IMAGE_TAG
+      docker build -t $COMM_ECR_REG/$CIRCLE_PROJECT_REPONAME:$IMAGE_TAG --build-arg base_image=$COMM_ECR_REG/$COMM_BASE .
+      docker images
+
+  - &push-image-to-ecr
+    name: Push image to ECR
+    command: |
+      # Docker push
+      docker push $COMM_ECR_REG/$CIRCLE_PROJECT_REPONAME:$IMAGE_TAG
+
+  - &update-deployment-config
+    name: Update deployment config
+    command: |
+      # Change deployment config
+      cd ~/
+      git config --global user.email "jacky.chu@nutanix.com"
+      git config --global user.name "jacky-chu-nutanix"
+      git clone https://jacky-chu-nutanix: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@github.com/nutanix-beam/cpaas-k8s-opsaas-gitops.git
+      cd ~/cpaas-k8s-opsaas-gitops
+      git checkout -b k8s-onboard origin/k8s-onboard
+      cd products-non-clutch/opsaas/manifests/$TEST_ENV
+      kubectl patch --local -f opsaas-ingestion-service-deployment.yaml \
+        -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"opsaas-ingestion-service\",\"image\":\"$COMM_ECR_REG/$CIRCLE_PROJECT_REPONAME:$IMAGE_TAG\"}]}}}}" \
+        -o yaml > deployment.yaml.tmp
+      cat deployment.yaml.tmp
+      mv deployment.yaml.tmp opsaas-ingestion-service-deployment.yaml
+
+      git add . && git commit -m "Update app opsaas-ingestion-service-$TEST_ENV to
+      $COMM_ECR_REG/$CIRCLE_PROJECT_REPONAME:$IMAGE_TAG
+      PR: $CIRCLE_PULL_REQUEST
+      Commit : $CIRCLE_PULL_REQUEST/commits/$CIRCLE_SHA1"
+
+      git push
+
+  - &sync-app
+    name: Sync Argocd app
+    command: |
+      # Argocd login
+      argocd login $ARGOCD_SERVER --username opsaas --password $ARGO_PWD --insecure
+
+      # Sync
+      argocd app sync opsaas-$TEST_ENV-app --prune --timeout 600 || true
+
+      # Waiting for health
+      argocd app wait opsaas-$TEST_ENV-app --health --sync  --timeout 600
+
+commands:
+  save-cache:
+    steps:
+      - run:
+          name: Download go modules dependencies
+          command: |
+            go mod vendor
+
+      - save_cache:
+          paths:
+            - ~/project/vendor
+          key: dependencies-{{ checksum "go.mod" }}
+
+  update-deployment-config:
+    parameters:
+      test_env:
+        description: Test env (dev1, qa1)
+        type: string
+    steps:
+      - run:
+          name: Update deployment config
+          command: |
+            # Change deployment config
+            cd ~/
+            git config --global user.email "jacky.chu@nutanix.com"
+            git config --global user.name "jacky-chu-nutanix"
+            git clone https://jacky-chu-nutanix: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@github.com/nutanix-beam/cpaas-k8s-oneops-gitops.git
+            cd ~/cpaas-k8s-oneops-gitops
+            git checkout -b k8s-onboard origin/k8s-onboard
+            cd products-non-clutch/oneops/manifests/<< parameters.test_env >>
+            kubectl patch --local -f deployment.yaml \
+              -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"$CIRCLE_PROJECT_REPONAME\",\"image\":\"$COMM_ECR_REG/$CIRCLE_PROJECT_REPONAME:$IMAGE_TAG\"}]}}}}" \
+              -o yaml > deployment.yml.tmp
+            cat deployment.yml.tmp
+            mv deployment.yml.tmp $CIRCLE_PROJECT_REPONAME-deployment.yml
+
+            # git add . && git commit -m "Update app $CIRCLE_PROJECT_REPONAME-<< parameters.test_env >> to
+            # $COMM_ECR_REG/$CIRCLE_PROJECT_REPONAME:$IMAGE_TAG
+            # PR: $CIRCLE_PULL_REQUEST
+            # Commit : $CIRCLE_PULL_REQUEST/commits/$CIRCLE_SHA1"
+
+            # git push
+
+  sync-app:
+    parameters:
+      test_env:
+        description: Test env (dev1, qa1)
+        type: string
+    steps:
+      - run:
+        name: Sync Argocd app
+        command: |
+          # Argocd login
+          argocd login $ARGOCD_SERVER --username admin --password $ARGO_PWD --insecure
+
+          # Sync
+          argocd app sync opsaas-<< parameters.test_env >>-app --prune --timeout 600 || true
+
+          # Waiting for health
+          argocd app wait opsaas-<< parameters.test_env >>-app --health --sync  --timeout 600
+
+jobs:
+  pr-workflow-jobs:
+    docker:
+      - image: 981042990700.dkr.ecr.us-west-2.amazonaws.com/oneops-xplay-common-service:tools.latest
+
+    steps:
+      - checkout
+
+      - run:
+          name: Code Quality Analysis
+          command: |
+            /tools/sonar-scanner-$SONAR_SCANNER_VERSION/bin/sonar-scanner -D"sonar.host.url=$SONARQUBE_HOST" \
+              -D"sonar.login=$SONARQUBE_TOKEN" \
+              -D"sonar.projectKey=$SONARQUBE_PROJECT_KEY" \
+              -D"sonar.branch.name=$CIRCLE_BRANCH" \
+              -D"sonar.exclusions=**/.idea/**/*,**/test/**/*,**/target/**/*" \
+              -D"project.settings=" \
+              -D"sonar.qualitygate.wait=true" || true
+
+            IFS='/' read -r -a PR <<< $CIRCLE_PULL_REQUEST
+            Code_Coverage=$(curl -ks -u $SONARQUBE_TOKEN: "$SONARQUBE_HOST/api/measures/search_history?component=$SONARQUBE_PROJECT_KEY&branch=$CIRCLE_BRANCH&metrics=coverage" | jq -r ".measures[0].history[-1].value")
+            java -jar /tools/opsaas-cicd-commands.jar github pr comment add -r=nutanix-beam/$CIRCLE_PROJECT_REPONAME -p=${PR[-1]} -c="Code quality check status: $SONARQUBE_HOST/dashboard?id=$SONARQUBE_PROJECT_KEY&branch=$CIRCLE_BRANCH"
+            java -jar /tools/opsaas-cicd-commands.jar github pr comment add -r=nutanix-beam/$CIRCLE_PROJECT_REPONAME -p=${PR[-1]} -c="Test coverage rate: $Code_Coverage %"
+
+      # - restore_cache:
+      #     keys:
+      #       - dependencies-{{ checksum "go.mod" }}
+      #       # fallback to using the latest cache if no exact match is found
+      #       - dependencies-
+
+      - run:
+          name: Unit Test
+          command: |
+            mkdir -p test-results
+            gotestsum --format pkgname --junitfile test-results/unit-tests.xml -- -coverprofile=test-results/cover.out ./...
+
+      - store_test_results:
+          path: test-results
+
+      - store_artifacts:
+          path: test-results
+
+  dev-integration-workflow-jobs:
+    machine: true
+    steps:
+      - checkout
+
+      - run: *setup-toolkits
+
+      # - restore_cache:
+      #     keys:
+      #       - dependencies-{{ checksum "go.mod" }}
+      #       # fallback to using the latest cache if no exact match is found
+      #       - dependencies-
+
+      # - run:
+      #     name: Download go modules dependencies
+      #     command: |
+      #       go mod vendor
+
+      # - save_cache:
+      #     paths:
+      #       - ~/project/vendor
+      #     key: dependencies-{{ checksum "go.mod" }}
+
+      - run:
+          name: Build package
+          command: |
+            go build -o main
+
+      - store_artifacts:
+          path: main
+
+      - run: *build-container-image
+
+      - run: *push-image-to-ecr
+
+      - run:
+          name: Setup test bed
+          command: |
+            export TEST_ENV=dev1
+            echo "export TEST_ENV=dev1" >> $BASH_ENV
+
+      - run: *update-deployment-config
+
+      - run: *sync-app
+
+  qa-staging-workflow-jobs:
+    machine: true
+    steps:
+      - checkout
+
+      - run: *setup-toolkits
+
+      - run:
+          name: Build package
+          command: |
+            go build -o main
+
+      - store_artifacts:
+          path: main
+
+      - run: *build-container-image
+
+      - run: *push-image-to-ecr
+
+      - run:
+          name: Setup test bed
+          command: |
+            export TEST_ENV=qa1
+            echo "export TEST_ENV=qa1" >> $BASH_ENV
+
+      - run: *update-deployment-config
+
+      - run: *sync-app
+
+  calibrate-workflow-jobs:
+    machine: true
+    steps:
+      - run:
+          name: Update dev branch and test environment
+          command: |
+            echo "Update dev branch and test environment"
+      - run:
+          name: Update qa branch and test environment
+          command: |
+            echo "Update qa branch and test environment"
+
+  release-workflow-jobs:
+    machine: true
+    steps:
+      - run:
+          name: Build
+          command: |
+            echo "build"
+      - run:
+          name: Patch Pre-release env
+          command: |
+            echo "patch"
+ 
+workflows:
+  version: 2
+
+  pr-workflow:
+    jobs:
+      - pr-workflow-jobs:
+          filters:
+            branches:
+              ignore:
+                - main
+                - master
+                - /qa\d+/
+                - /dev\d+/
+                - /dev\d+-pr\d+/
+                - /qa\d+-\d+/
+
+  dev-integration-workflow:
+    jobs:
+      - dev-integration-workflow-jobs:
+          filters:
+            branches:
+              only:
+              # ex: dev1-pr1
+                - /dev\d+-pr\d+/
+  
+  qa-staging-workflow:
+    jobs:
+      - qa-staging-workflow-jobs:
+          filters:
+            branches:
+              only:
+              # ex: qa1-04052022
+                - /qa\d+-\d+/
+
+  calibrate-workflow:
+    jobs:
+      - calibrate-workflow-jobs:
+          filters:
+            branches:
+              only:
+                - main
+                - master
