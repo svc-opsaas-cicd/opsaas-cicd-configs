@@ -1,159 +1,5 @@
 version: 2
 
-aliases:
-  - &check-build-components
-    name: Check build components
-    command: |
-      pip install -r .circleci/requirements.txt
-      git --no-pager diff --name-only origin/main... | .circleci/find-build-components.py --build_components .circleci/build-components.yaml > ~/project/build-components.txt
-      cat ~/project/build-components.txt
-      export CIRCLECI_BUILD_COMPONENTS="$(cat ~/project/build-components.txt)"
-      echo $CIRCLECI_BUILD_COMPONENTS
-      echo "export CIRCLECI_BUILD_COMPONENTS=$CIRCLECI_BUILD_COMPONENTS" >> $BASH_ENV
-
-  - &setup-toolkits
-    name: Setup Build Environment Variables
-    command: |
-      echo "export GIT_SHA=${CIRCLE_SHA1:0:7}" >> $BASH_ENV
-      export GIT_COMMIT_USER=$(git show -s --format='%an' $CIRCLE_SHA1)
-      echo "export GIT_COMMIT_USER=$GIT_COMMIT_USER" >> $BASH_ENV
-      echo "export IMAGE_TAG=$CIRCLE_BRANCH-${CIRCLE_SHA1:0:7}" >> $BASH_ENV
-
-      # Shows toolkits version
-      docker -v
-      java -version
-      go version
-      cat $BASH_ENV
-
-  - &build-components
-    name: Build components
-    command: |
-      sudo apt install protobuf-compiler
-      go get -u github.com/golang/protobuf/{proto,protoc-gen-go}
-      cd $CIRCLE_WORKING_DIRECTORY/services/common/protos
-      echo "Running proto generator .."
-      ./gen_proto.sh
-
-      IFS=',' read -r -a components <<< "$CIRCLECI_BUILD_COMPONENTS"
-      for comp in "${components[@]}"
-      do
-        echo "Building component: $comp"
-        cd $CIRCLE_WORKING_DIRECTORY/services
-      done
-
-  - &build-container-image
-    name: Build container image
-    command: |
-      # Docker login ECR
-      aws ecr get-login-password --region $COMM_ECR_REGION | docker login --username AWS --password-stdin $COMM_ECR_REG
-
-      echo $IMAGE_TAG
-      docker build -t $COMM_ECR_REG/$CIRCLE_PROJECT_REPONAME:$IMAGE_TAG --build-arg base_image=$COMM_ECR_REG/$COMM_BASE .
-      docker images
-
-  - &push-image-to-ecr
-    name: Push image to ECR
-    command: |
-      # Docker push
-      docker push $COMM_ECR_REG/$CIRCLE_PROJECT_REPONAME:$IMAGE_TAG
-
-  - &update-deployment-config
-    name: Update deployment config
-    command: |
-      # Change deployment config
-      cd ~/
-      git config --global user.email "jacky.chu@nutanix.com"
-      git config --global user.name "jacky-chu-nutanix"
-      git clone https://jacky-chu-nutanix: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@github.com/nutanix-beam/cpaas-k8s-opsaas-gitops.git
-      cd ~/cpaas-k8s-opsaas-gitops
-      git checkout -b k8s-onboard origin/k8s-onboard
-      cd products-non-clutch/opsaas/manifests/$TEST_ENV
-      kubectl patch --local -f opsaas-ingestion-service-deployment.yaml \
-        -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"opsaas-ingestion-service\",\"image\":\"$COMM_ECR_REG/$CIRCLE_PROJECT_REPONAME:$IMAGE_TAG\"}]}}}}" \
-        -o yaml > deployment.yaml.tmp
-      cat deployment.yaml.tmp
-      mv deployment.yaml.tmp opsaas-ingestion-service-deployment.yaml
-
-      git add . && git commit -m "Update app opsaas-ingestion-service-$TEST_ENV to
-      $COMM_ECR_REG/$CIRCLE_PROJECT_REPONAME:$IMAGE_TAG
-      PR: $CIRCLE_PULL_REQUEST
-      Commit : $CIRCLE_PULL_REQUEST/commits/$CIRCLE_SHA1"
-
-      git push
-
-  - &sync-app
-    name: Sync Argocd app
-    command: |
-      # Argocd login
-      argocd login $ARGOCD_SERVER --username opsaas --password $ARGO_PWD --insecure
-
-      # Sync
-      argocd app sync opsaas-$TEST_ENV-app --prune --timeout 600 || true
-
-      # Waiting for health
-      argocd app wait opsaas-$TEST_ENV-app --health --sync  --timeout 600
-
-commands:
-  save-cache:
-    steps:
-      - run:
-          name: Download go modules dependencies
-          command: |
-            go mod vendor
-
-      - save_cache:
-          paths:
-            - ~/project/vendor
-          key: dependencies-{{ checksum "go.mod" }}
-
-  update-deployment-config:
-    parameters:
-      test_env:
-        description: Test env (dev1, qa1)
-        type: string
-    steps:
-      - run:
-          name: Update deployment config
-          command: |
-            # Change deployment config
-            cd ~/
-            git config --global user.email "jacky.chu@nutanix.com"
-            git config --global user.name "jacky-chu-nutanix"
-            git clone https://jacky-chu-nutanix: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@github.com/nutanix-beam/cpaas-k8s-oneops-gitops.git
-            cd ~/cpaas-k8s-oneops-gitops
-            git checkout -b k8s-onboard origin/k8s-onboard
-            cd products-non-clutch/oneops/manifests/<< parameters.test_env >>
-            kubectl patch --local -f deployment.yaml \
-              -p "{\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"name\":\"$CIRCLE_PROJECT_REPONAME\",\"image\":\"$COMM_ECR_REG/$CIRCLE_PROJECT_REPONAME:$IMAGE_TAG\"}]}}}}" \
-              -o yaml > deployment.yml.tmp
-            cat deployment.yml.tmp
-            mv deployment.yml.tmp $CIRCLE_PROJECT_REPONAME-deployment.yml
-
-            # git add . && git commit -m "Update app $CIRCLE_PROJECT_REPONAME-<< parameters.test_env >> to
-            # $COMM_ECR_REG/$CIRCLE_PROJECT_REPONAME:$IMAGE_TAG
-            # PR: $CIRCLE_PULL_REQUEST
-            # Commit : $CIRCLE_PULL_REQUEST/commits/$CIRCLE_SHA1"
-
-            # git push
-
-  sync-app:
-    parameters:
-      test_env:
-        description: Test env (dev1, qa1)
-        type: string
-    steps:
-      - run:
-        name: Sync Argocd app
-        command: |
-          # Argocd login
-          argocd login $ARGOCD_SERVER --username admin --password $ARGO_PWD --insecure
-
-          # Sync
-          argocd app sync opsaas-<< parameters.test_env >>-app --prune --timeout 600 || true
-
-          # Waiting for health
-          argocd app wait opsaas-<< parameters.test_env >>-app --health --sync  --timeout 600
-
 jobs:
   pr-workflow-jobs:
     docker:
@@ -196,64 +42,6 @@ jobs:
       - store_artifacts:
           path: test-results
 
-  dev-integration-workflow-jobs:
-    machine: true
-    steps:
-      - checkout
-
-      - run: *setup-toolkits
-
-      - run:
-          name: Build compo
-          command: |
-            go build -o main
-
-      - store_artifacts:
-          path: main
-
-      - run: *build-container-image
-
-      # - run: *push-image-to-ecr
-
-      # - run:
-      #     name: Setup test bed
-      #     command: |
-      #       export TEST_ENV=dev1
-      #       echo "export TEST_ENV=dev1" >> $BASH_ENV
-
-      # - run: *update-deployment-config
-
-      # - run: *sync-app
-
-  qa-staging-workflow-jobs:
-    machine: true
-    steps:
-      - checkout
-
-      - run: *setup-toolkits
-
-      - run:
-          name: Build package
-          command: |
-            go build -o main
-
-      - store_artifacts:
-          path: main
-
-      - run: *build-container-image
-
-      - run: *push-image-to-ecr
-
-      - run:
-          name: Setup test bed
-          command: |
-            export TEST_ENV=qa1
-            echo "export TEST_ENV=qa1" >> $BASH_ENV
-
-      - run: *update-deployment-config
-
-      - run: *sync-app
-
   calibrate-workflow-jobs:
     machine: true
     steps:
@@ -284,8 +72,8 @@ jobs:
       - run: 
           name: Check build components
           command: |
-            pip install -r .circleci/requirements.txt
-            git --no-pager diff --name-only HEAD^ HEAD | .circleci/find-build-components.py --build_components .circleci/build-components.yaml > ~/project/build-components.txt
+            pip install -r .circleci/multi_services/requirements.txt
+            git --no-pager diff --name-only HEAD^ HEAD | .circleci/multi_services/find-build-components.py --build_components .circleci/multi_services/build-components.yaml > ~/project/build-components.txt
             cat ~/project/build-components.txt
             export CIRCLECI_BUILD_COMPONENTS="$(cat ~/project/build-components.txt)"
             echo "export CIRCLECI_BUILD_COMPONENTS=$CIRCLECI_BUILD_COMPONENTS" >> $BASH_ENV
@@ -370,18 +158,6 @@ jobs:
             python ntnx-api-release-engineering/py/publish_doc.py --registry http://10.41.28.200:8045 --yaml ~/project/api/playbooks/playbooks-api-definitions/target/generated-api-artifacts/swagger-aiops-*-all.yaml
           environment:
                 PYENV_VERSION: canaveral_build
-
-  release-workflow-jobs:
-    machine: true
-    steps:
-      - run:
-          name: Build
-          command: |
-            echo "build"
-      - run:
-          name: Patch Pre-release env
-          command: |
-            echo "patch"
  
 workflows:
   version: 2
